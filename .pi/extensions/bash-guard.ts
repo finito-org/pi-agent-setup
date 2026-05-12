@@ -1,5 +1,11 @@
-import type { ExtensionAPI, ToolCallEventResult, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolCallEventResult, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { isBashToolResult, isToolCallEventType } from "@earendil-works/pi-coding-agent";
+
+type ToolResultPatch = {
+  content?: ToolResultEvent["content"];
+  details?: ToolResultEvent["details"];
+  isError?: boolean;
+};
 
 const WORKDIR_ERROR =
   "work only in the current dir, never use `cd ..`, `cd /`, `git -C`, or other directory-changing tricks";
@@ -485,7 +491,7 @@ function isUnsafePathToken(token: string): boolean {
   if (/^\$\{?PWD\}?($|\/)/.test(pathValue)) return true;
   if (/\$\(\s*pwd\s*\)|`\s*pwd\s*`/.test(pathValue)) return true;
   if (/(^|\/)\.\.($|\/)/.test(pathValue)) return true;
-  if (/^file:\/\//.test(pathValue)) return true;
+  if (pathValue.startsWith("file://")) return true;
 
   return false;
 }
@@ -546,15 +552,13 @@ function prefixRgReplacement(text: string, command: string): string {
   return `${RG_REPLACEMENT_PREFIX}: ${command}\n${text}`;
 }
 
-function patchBashResultContent(
-  event: Parameters<Parameters<ExtensionAPI["on"]>[1]>[0]
-): ToolResultEventResult | null {
-  if (!isBashToolResult(event)) return null;
+function patchBashResultContent(event: ToolResultEvent): ToolResultPatch | undefined {
+  if (!isBashToolResult(event)) return undefined;
 
   const replacementCommand = rgReplacementByToolCallId.get(event.toolCallId);
   rgReplacementByToolCallId.delete(event.toolCallId);
 
-  if (!replacementCommand && !event.isError) return null;
+  if (!replacementCommand && !event.isError) return undefined;
 
   let content = event.content;
 

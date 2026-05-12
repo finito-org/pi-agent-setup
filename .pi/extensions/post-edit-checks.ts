@@ -1,9 +1,15 @@
-import type { ExtensionAPI, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { isEditToolResult, isWriteToolResult } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+
+type ToolResultPatch = {
+  content?: ToolResultEvent["content"];
+  details?: ToolResultEvent["details"];
+  isError?: boolean;
+};
 
 interface CommandResult {
   command: string;
@@ -131,14 +137,14 @@ function failureOutput(failures: CheckFailure[]): string {
   ].join("\n");
 }
 
-function affectedPathFromEvent(event: Parameters<Parameters<ExtensionAPI["on"]>[1]>[0]): string | null {
+function affectedPathFromEvent(event: ToolResultEvent): string | null {
   if (!isEditToolResult(event) && !isWriteToolResult(event)) return null;
   if (event.isError) return null;
   const filePath = event.input.path;
   return typeof filePath === "string" ? filePath : null;
 }
 
-async function runPostEditChecks(filePath: string): Promise<ToolResultEventResult | undefined> {
+async function runPostEditChecks(filePath: string): Promise<ToolResultPatch | undefined> {
   if (!isCheckableFile(filePath)) return undefined;
 
   const root = process.cwd();
