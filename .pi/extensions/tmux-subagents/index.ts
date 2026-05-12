@@ -446,6 +446,42 @@ function formatArgRows(args, maxRows = 8) {
   return rows;
 }
 
+function primaryInlineArgKey(name, args) {
+  if (!args || typeof args !== "object") return "";
+  const normalized = String(name ?? "").toLowerCase();
+  if (normalized === "read" || normalized.endsWith(".read")) {
+    if (Object.hasOwn(args, "path")) return "path";
+    if (Object.hasOwn(args, "file_path")) return "file_path";
+  }
+  return "";
+}
+
+function formatInlineArg(key, value) {
+  const renderedValue = previewValue(value, 180);
+  if (value === true) return key;
+  return renderedValue ? key + " " + renderedValue : key;
+}
+
+function formatToolTitle(prefix, name, args, max = 360) {
+  const title = prefix + name;
+  if (args === undefined || args === null || args === "") return title;
+  if (typeof args !== "object") return truncate(title + " " + previewValue(args, max), max);
+
+  const entries = Object.entries(args);
+  if (entries.length === 0) return title + " {}";
+
+  const primaryKey = primaryInlineArgKey(name, args);
+  const parts = [];
+  if (primaryKey) parts.push(previewValue(args[primaryKey], 180));
+  for (const [key, value] of entries) {
+    if (key === primaryKey) continue;
+    parts.push(formatInlineArg(key, value));
+  }
+
+  const suffix = parts.filter(Boolean).join(" ");
+  return suffix ? truncate(title + " " + suffix, max) : title;
+}
+
 function bashCommandFrom(args) {
   if (typeof args === "string") return compact(args);
   if (!args || typeof args !== "object") return "";
@@ -467,7 +503,7 @@ function printToolRequested(call) {
   const name = toolNameFrom(call);
   if (isBashToolName(name)) return;
   const args = toolArgsFrom(call);
-  printBlock("tool requested: " + name, formatArgRows(args, 6), "tool");
+  printBlock(formatToolTitle("tool requested: ", name, args), [], "tool");
 }
 
 function printOpenToolBlock(key, title, rows) {
@@ -505,7 +541,7 @@ function printToolStart(event) {
     return;
   }
 
-  printOpenToolBlock(key, "running tool: " + name, formatArgRows(args, 10));
+  printOpenToolBlock(key, formatToolTitle("running tool: ", name, args), []);
   active.wrapperOpen = true;
 }
 
