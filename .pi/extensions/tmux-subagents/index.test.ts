@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  formatQuestionForMainAgent,
+  formatSubagentCompletionForMainAgent,
+  formatSubagentDuration,
+  formatSubagentUsage,
   planSubagentPlacement,
+  questionNeedsUserPrompt,
   restoreRecordsForWindow,
   type SpawnedSubagentRecord,
 } from "./state";
@@ -52,6 +57,60 @@ describe("planSubagentPlacement", () => {
       target: "main",
       size: "30%",
     });
+  });
+});
+
+describe("question forwarding", () => {
+  test("prompts the user when the subagent is unsure", () => {
+    expect(
+      questionNeedsUserPrompt({ id: "q1", type: "question", addressedTo: "unsure", question: "Which path should I take?" })
+    ).toBe(true);
+  });
+
+  test("formats subagent question with task and recent pane context", () => {
+    const text = formatQuestionForMainAgent(
+      record("worker", "%7", "@current"),
+      {
+        id: "q1",
+        type: "question",
+        addressedTo: "main_agent",
+        question: "Should I run tests now?",
+        whatDone: "Read the extension files.",
+      },
+      "assistant> I inspected the files"
+    );
+
+    expect(text).toContain('Subagent "worker" (%7) has a question.');
+    expect(text).toContain("Question: Should I run tests now?");
+    expect(text).toContain("Read the extension files.");
+    expect(text).toContain("assistant> I inspected the files");
+  });
+});
+
+describe("completion summaries", () => {
+  test("formats duration and usage", () => {
+    expect(formatSubagentDuration(123_400)).toBe("2m 3s");
+    expect(formatSubagentUsage({ input: 1200, output: 345, cacheRead: 0, cacheWrite: 0, totalTokens: 1545, cost: 0.01234, turns: 1 })).toBe(
+      "1 turn ↑1.2k ↓345 total:1.5k $0.0123"
+    );
+  });
+
+  test("asks the main agent to summarize completion details", () => {
+    const text = formatSubagentCompletionForMainAgent(record("worker", "%7", "@current"), {
+      type: "done",
+      task: "Review the tmux subagent extension.",
+      result: "Found no blocking issues; recommended one test update.",
+      runtimeMs: 65_000,
+      usage: { input: 1000, output: 250, totalTokens: 1250, cost: 0.0042, turns: 1 },
+      status: "success",
+      model: "claude-test",
+    });
+
+    expect(text).toContain('Subagent "worker" (%7) finished.');
+    expect(text).toContain("Task:\nReview the tmux subagent extension.");
+    expect(text).toContain("Runtime: 1m 5s");
+    expect(text).toContain("Cost: $0.0042");
+    expect(text).toContain("Result:\nFound no blocking issues");
   });
 });
 

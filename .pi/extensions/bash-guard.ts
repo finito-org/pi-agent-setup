@@ -16,6 +16,7 @@ const EXTENSION_FAILURE_ERROR = "bash guard extension failed";
 const EXIT_CODE_ONE = "Exit code: 1";
 const EXIT_CODE_UNKNOWN = "Exit code: unknown";
 const RG_REPLACEMENT_PREFIX = "using rg instead";
+const UNSUPPORTED_FIND_REWRITE_ERROR = "find command uses unsupported arguments for rg rewrite";
 
 interface RuleViolation {
   rule: "workdir" | "python" | "dev-server";
@@ -44,6 +45,13 @@ interface SegmentRewriteResult {
 interface SplitCommandWords {
   assignments: string[];
   commandWords: string[];
+}
+
+export class SearchRewriteError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SearchRewriteError";
+  }
 }
 
 const shellOperators = new Set([";", "&", "|", "(", ")", "<", ">", "\n"]);
@@ -228,50 +236,116 @@ function rewriteGrepWords(words: string[]): string[] {
   return rewritten;
 }
 
+function unsupportedFindArgument(argument: string): never {
+  throw new SearchRewriteError(`${UNSUPPORTED_FIND_REWRITE_ERROR}: ${argument}`);
+}
+
+function requiredFindArgument(words: string[], index: number): string {
+  const word = words[index] ?? "";
+  const value = words[index + 1] ?? "";
+  if (!value) unsupportedFindArgument(`${word} needs a value`);
+  return value;
+}
+
+function requiredFindDepth(words: string[], index: number): string {
+  const word = words[index] ?? "";
+  const depth = requiredFindArgument(words, index);
+  if (!/^\d+$/.test(depth)) unsupportedFindArgument(`${word} ${depth}`);
+  return depth;
+}
+
+function normalizeFindPathGlob(pattern: string): string {
+  return pattern.startsWith("./") ? pattern.slice(2) : pattern;
+}
+
+function pushFindGlob(rewritten: string[], predicate: string, pattern: string, negated = false) {
+  const caseInsensitive = predicate === "-iname" || predicate === "-ipath";
+  const pathPredicate = predicate === "-path" || predicate === "-ipath";
+  const glob = pathPredicate ? normalizeFindPathGlob(pattern) : pattern;
+  rewritten.push(caseInsensitive ? "--iglob" : "-g", negated ? `!${glob}` : glob);
+}
+
 function rewriteFindWords(words: string[]): string[] {
-  const rewritten = ["rg", "--files"];
+  const rewritten = ["rg", "--files", "--hidden", "--no-ignore"];
   const roots: string[] = [];
+  let followsSymlinks = false;
   let index = 1;
 
   while (index < words.length) {
     const word = words[index] ?? "";
+    if (word === "-L") {
+      followsSymlinks = true;
+      index += 1;
+      continue;
+    }
+    if (word === "-H" || word === "-P" || /^-O\d*$/.test(word)) {
+      index += 1;
+      continue;
+    }
     if (word.startsWith("-") || word === "!" || word === "(" || word === ")") break;
     roots.push(word);
     index += 1;
   }
 
+  if (followsSymlinks) rewritten.push("--follow");
   rewritten.push(...(roots.length > 0 ? roots : ["."]));
 
   while (index < words.length) {
     const word = words[index] ?? "";
     const next = words[index + 1] ?? "";
 
-    if (word === "-maxdepth" && next) {
-      rewritten.push("--max-depth", next);
+    if (word === "-maxdepth") {
+      rewritten.push("--max-depth", requiredFindDepth(words, index));
       index += 2;
       continue;
     }
-    if (["-name", "-iname", "-path", "-ipath"].includes(word) && next) {
-      rewritten.push("-g", next);
+    if (word === "-mindepth") {
+      const depth = requiredFindDepth(words, index);
+      if (depth !== "0" && depth !== "1") unsupportedFindArgument(`${word} ${depth}`);
       index += 2;
       continue;
     }
-    if ((word === "!" || word === "-not") && ["-name", "-path"].includes(next)) {
+    if (word === "-type") {
+      const type = requiredFindArgument(words, index);
+      if (type !== "f") unsupportedFindArgument(`${word} ${type}`);
+      index += 2;
+      continue;
+    }
+    if (["-name", "-iname", "-path", "-ipath"].includes(word)) {
+      pushFindGlob(rewritten, word, requiredFindArgument(words, index));
+      index += 2;
+      continue;
+    }
+    if ((word === "!" || word === "-not") && ["-name", "-iname", "-path", "-ipath"].includes(next)) {
       const pattern = words[index + 2] ?? "";
-      if (pattern) rewritten.push("-g", `!${pattern}`);
+      if (!pattern) unsupportedFindArgument(`${word} ${next} needs a value`);
+      pushFindGlob(rewritten, next, pattern, true);
       index += 3;
       continue;
     }
-    if (["-type", "-mindepth", "-mtime", "-size", "-user", "-group"].includes(word)) {
-      index += 2;
+    if ((word === "!" || word === "-not") && next === "-type") {
+      const type = words[index + 2] ?? "";
+      if (!type) unsupportedFindArgument(`${word} ${next} needs a value`);
+      if (type !== "d") unsupportedFindArgument(`${word} ${next} ${type}`);
+      index += 3;
       continue;
     }
-    if (["-print", "(", ")"].includes(word)) {
+    if (word === "-L") {
+      rewritten.push("--follow");
+      index += 1;
+      continue;
+    }
+    if (word === "-print0") {
+      rewritten.push("-0");
+      index += 1;
+      continue;
+    }
+    if (["-print", "-true", "-a", "-and", "-o", "-or", "-H", "-P", "-xdev", "-mount", "-depth", "(", ")"].includes(word)) {
       index += 1;
       continue;
     }
 
-    index += 1;
+    unsupportedFindArgument(word);
   }
 
   return rewritten;
@@ -337,7 +411,7 @@ function rewriteSearchSegment(words: string[]): SegmentRewriteResult {
   return { words, changed: false };
 }
 
-function replaceSearchCommand(command: string): SearchRewriteResult | null {
+export function replaceSearchCommand(command: string): SearchRewriteResult | null {
   const tokens = shellTokenize(command);
   const rebuiltTokens: RebuiltShellToken[] = [];
   let segment: ShellToken[] = [];
@@ -608,6 +682,7 @@ export default function bashGuard(pi: ExtensionAPI) {
       return block(violation.detail);
     } catch (error) {
       rgReplacementByToolCallId.delete(event.toolCallId);
+      if (error instanceof SearchRewriteError) return block(error.message);
       const detail = error instanceof Error ? error.message : String(error);
       return block(`${EXTENSION_FAILURE_ERROR}: ${detail}`);
     }

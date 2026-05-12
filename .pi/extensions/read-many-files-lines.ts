@@ -98,10 +98,6 @@ function resolveInsideRoot(root: string, filePath: string): string | null {
   return insideRoot ? absolutePath : null;
 }
 
-function formatLineNumber(lineNumber: number, width: number): string {
-  return String(lineNumber).padStart(width, " ");
-}
-
 async function readRange(root: string, range: FileLineRange): Promise<string> {
   if (!range.file) return `=== ${range.raw} ===\n[ERROR: empty file path]\n`;
   if (range.startLine < 1) return `=== ${range.raw} ===\n[ERROR: start line must be >= 1]\n`;
@@ -115,12 +111,8 @@ async function readRange(root: string, range: FileLineRange): Promise<string> {
     const lines = text.split(/\r?\n/);
     const endLine = Math.min(range.endLine, lines.length);
     const selectedLines = lines.slice(range.startLine - 1, endLine);
-    const width = String(endLine).length;
-    const body = selectedLines
-      .map((line, index) => `${formatLineNumber(range.startLine + index, width)} | ${line}`)
-      .join("\n");
-    const suffix = body ? "" : "[no lines in range]";
-    return `=== ${range.raw} ===\n${body}${suffix}\n`;
+    const body = selectedLines.join("\n");
+    return `=== ${range.raw} ===\n${selectedLines.length > 0 ? body : "[no lines in range]"}\n`;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return `=== ${range.raw} ===\n[ERROR: ${message}]\n`;
