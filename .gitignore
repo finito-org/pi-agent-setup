@@ -1,3 +1,6 @@
+# Pi runtime artifacts
+.pi/tmp/
+
 # Logs
 logs
 *.log

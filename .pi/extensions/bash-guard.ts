@@ -1,0 +1,613 @@
+import type { ExtensionAPI, ToolCallEventResult, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
+import { isBashToolResult, isToolCallEventType } from "@earendil-works/pi-coding-agent";
+
+const WORKDIR_ERROR =
+  "work only in the current dir, never use `cd ..`, `cd /`, `git -C`, or other directory-changing tricks";
+const PYTHON_ERROR = "never use ad hoc python: use jq to parse json, use bun to run js";
+const DEV_SERVER_ERROR =
+  "never run the dev server; use `bun scripts/find-port.ts --wait` instead";
+const EXTENSION_FAILURE_ERROR = "bash guard extension failed";
+const EXIT_CODE_ONE = "Exit code: 1";
+const EXIT_CODE_UNKNOWN = "Exit code: unknown";
+const RG_REPLACEMENT_PREFIX = "using rg instead";
+
+interface RuleViolation {
+  rule: "workdir" | "python" | "dev-server";
+  detail: string;
+}
+
+interface ShellToken {
+  text: string;
+  quoted: boolean;
+}
+
+interface RebuiltShellToken {
+  text: string;
+  operator: boolean;
+}
+
+interface SearchRewriteResult {
+  command: string;
+}
+
+interface SegmentRewriteResult {
+  words: string[];
+  changed: boolean;
+}
+
+interface SplitCommandWords {
+  assignments: string[];
+  commandWords: string[];
+}
+
+const shellOperators = new Set([";", "&", "|", "(", ")", "<", ">", "\n"]);
+const commandBreakers = new Set([";", "&&", "||", "|", "(", ")", "&", "<", ">", "\n"]);
+const pythonCommands = new Set(["python", "python3", "python2", "pythonw", "pypy", "pypy3", "py"]);
+const devPackageManagers = new Set(["npm", "pnpm", "yarn"]);
+const devFrameworkCommands = new Set(["next", "vite", "nuxt", "astro", "remix"]);
+const pathOptionNames = new Set([
+  "--cwd",
+  "--prefix",
+  "--dir",
+  "--directory",
+  "--work-tree",
+  "--git-dir",
+  "--pathspec-from-file",
+]);
+const pathAssignmentNames = new Set(["GIT_DIR", "GIT_WORK_TREE", "PWD", "OLDPWD", "INIT_CWD"]);
+const destructiveGhApiFlags = new Set(["DELETE", "PATCH", "POST", "PUT"]);
+const grepSearchCommands = new Set(["grep", "egrep", "fgrep", "ggrep", "git-grep"]);
+const directSearchCommands = new Set(["ag", "ack", "sift", "pt", "the_silver_searcher"]);
+const rgReplacementByToolCallId = new Map<string, string>();
+
+function block(reason: string): ToolCallEventResult {
+  return { block: true, reason: `${reason}\n${EXIT_CODE_ONE}` };
+}
+
+function normalizeCommandName(value: string): string {
+  const withoutPath = value.split("/").filter(Boolean).at(-1) ?? value;
+  const withoutExtension = withoutPath.replace(/\.(?:cmd|exe|ps1)$/i, "");
+  return withoutExtension.toLowerCase();
+}
+
+function shellTokenize(command: string): ShellToken[] {
+  const tokens: ShellToken[] = [];
+  let current = "";
+  let quote: "'" | '"' | "`" | "" = "";
+  let tokenQuoted = false;
+
+  function pushCurrent() {
+    if (!current && !tokenQuoted) return;
+    tokens.push({ text: current, quoted: tokenQuoted });
+    current = "";
+    tokenQuoted = false;
+  }
+
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index] ?? "";
+    const next = command[index + 1] ?? "";
+
+    if (quote) {
+      if (char === "\\" && quote !== "'" && next) {
+        current += next;
+        index += 1;
+        continue;
+      }
+      if (char === quote) {
+        quote = "";
+        tokenQuoted = true;
+        continue;
+      }
+      current += char;
+      continue;
+    }
+
+    if (char === "'" || char === '"' || char === "`") {
+      quote = char;
+      tokenQuoted = true;
+      continue;
+    }
+
+    if (char === "\\" && next) {
+      current += next;
+      index += 1;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      pushCurrent();
+      continue;
+    }
+
+    if (char === "#" && !current) {
+      while (index < command.length && command[index] !== "\n") index += 1;
+      index -= 1;
+      continue;
+    }
+
+    if ((char === "&" && next === "&") || (char === "|" && next === "|")) {
+      pushCurrent();
+      tokens.push({ text: `${char}${next}`, quoted: false });
+      index += 1;
+      continue;
+    }
+
+    if (shellOperators.has(char)) {
+      pushCurrent();
+      tokens.push({ text: char, quoted: false });
+      continue;
+    }
+
+    current += char;
+  }
+
+  pushCurrent();
+  return tokens;
+}
+
+function commandSegments(tokens: ShellToken[]): string[][] {
+  const segments: string[][] = [];
+  let current: string[] = [];
+
+  for (const token of tokens) {
+    if (commandBreakers.has(token.text)) {
+      if (current.length > 0) segments.push(current);
+      current = [];
+      continue;
+    }
+    current.push(token.text);
+  }
+
+  if (current.length > 0) segments.push(current);
+  return segments;
+}
+
+function stripLeadingAssignments(words: string[]): string[] {
+  const firstCommandIndex = words.findIndex((word) => !/^[A-Za-z_][A-Za-z0-9_]*=.*/.test(word));
+  if (firstCommandIndex === -1) return [];
+  return words.slice(firstCommandIndex);
+}
+
+function commandWord(words: string[]): string {
+  const runnableWords = stripLeadingAssignments(words);
+  return normalizeCommandName(runnableWords[0] ?? "");
+}
+
+function splitCommandWords(words: string[]): SplitCommandWords {
+  const firstCommandIndex = words.findIndex((word) => !/^[A-Za-z_][A-Za-z0-9_]*=.*/.test(word));
+  if (firstCommandIndex === -1) return { assignments: words, commandWords: [] };
+  return {
+    assignments: words.slice(0, firstCommandIndex),
+    commandWords: words.slice(firstCommandIndex),
+  };
+}
+
+function shellQuote(word: string): string {
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(word)) return word;
+  return `'${word.replace(/'/g, `'\\''`)}'`;
+}
+
+function joinShellTokens(tokens: RebuiltShellToken[]): string {
+  return tokens.reduce((command, token) => {
+    if (token.text === "\n") return `${command.trimEnd()}\n`;
+    if (token.operator) return `${command.trimEnd()} ${token.text} `;
+    const separator = command && !command.endsWith(" ") && !command.endsWith("\n") ? " " : "";
+    return `${command}${separator}${shellQuote(token.text)}`;
+  }, "").trim();
+}
+
+function rewriteGrepWords(words: string[]): string[] {
+  const command = normalizeCommandName(words[0] ?? "");
+  const rewritten = command === "fgrep" ? ["rg", "-F"] : ["rg"];
+
+  for (const word of words.slice(1)) {
+    if (["-R", "-r", "--recursive"].includes(word)) continue;
+    if (["-E", "--extended-regexp"].includes(word)) continue;
+    if (word.startsWith("--include=")) {
+      rewritten.push("-g", word.slice("--include=".length));
+      continue;
+    }
+    if (word.startsWith("--exclude=")) {
+      rewritten.push("-g", `!${word.slice("--exclude=".length)}`);
+      continue;
+    }
+    if (/^-[A-Za-z]+$/.test(word) && /[RrE]/.test(word)) {
+      const flags = word.slice(1).replace(/[RrE]/g, "");
+      if (flags) rewritten.push(`-${flags}`);
+      continue;
+    }
+    rewritten.push(word);
+  }
+
+  return rewritten;
+}
+
+function rewriteFindWords(words: string[]): string[] {
+  const rewritten = ["rg", "--files"];
+  const roots: string[] = [];
+  let index = 1;
+
+  while (index < words.length) {
+    const word = words[index] ?? "";
+    if (word.startsWith("-") || word === "!" || word === "(" || word === ")") break;
+    roots.push(word);
+    index += 1;
+  }
+
+  rewritten.push(...(roots.length > 0 ? roots : ["."]));
+
+  while (index < words.length) {
+    const word = words[index] ?? "";
+    const next = words[index + 1] ?? "";
+
+    if (word === "-maxdepth" && next) {
+      rewritten.push("--max-depth", next);
+      index += 2;
+      continue;
+    }
+    if (["-name", "-iname", "-path", "-ipath"].includes(word) && next) {
+      rewritten.push("-g", next);
+      index += 2;
+      continue;
+    }
+    if ((word === "!" || word === "-not") && ["-name", "-path"].includes(next)) {
+      const pattern = words[index + 2] ?? "";
+      if (pattern) rewritten.push("-g", `!${pattern}`);
+      index += 3;
+      continue;
+    }
+    if (["-type", "-mindepth", "-mtime", "-size", "-user", "-group"].includes(word)) {
+      index += 2;
+      continue;
+    }
+    if (["-print", "(", ")"].includes(word)) {
+      index += 1;
+      continue;
+    }
+
+    index += 1;
+  }
+
+  return rewritten;
+}
+
+function rewriteFdWords(words: string[]): string[] {
+  const rewritten = ["rg", "--files"];
+  let pattern = "";
+
+  for (let index = 1; index < words.length; index += 1) {
+    const word = words[index] ?? "";
+    const next = words[index + 1] ?? "";
+
+    if (["-e", "--extension"].includes(word) && next) {
+      rewritten.push("-g", `*.${next}`);
+      index += 1;
+      continue;
+    }
+    if (word.startsWith("-")) continue;
+    if (!pattern) {
+      pattern = word;
+      continue;
+    }
+    rewritten.push(word);
+  }
+
+  if (pattern && pattern !== ".") rewritten.push("-g", `*${pattern}*`);
+  return rewritten;
+}
+
+function rewriteLocateWords(words: string[]): string[] {
+  const pattern = words.find((word, index) => index > 0 && !word.startsWith("-"));
+  return pattern ? ["rg", "--files", ".", "-g", `*${pattern}*`] : ["rg", "--files", "."];
+}
+
+function rewriteSearchSegment(words: string[]): SegmentRewriteResult {
+  const split = splitCommandWords(words);
+  const first = normalizeCommandName(split.commandWords[0] ?? "");
+  const second = normalizeCommandName(split.commandWords[1] ?? "");
+
+  if (first === "git" && second === "grep") {
+    return {
+      words: [...split.assignments, ...rewriteGrepWords(split.commandWords.slice(1))],
+      changed: true,
+    };
+  }
+  if (grepSearchCommands.has(first)) {
+    return { words: [...split.assignments, ...rewriteGrepWords(split.commandWords)], changed: true };
+  }
+  if (directSearchCommands.has(first)) {
+    return { words: [...split.assignments, "rg", ...split.commandWords.slice(1)], changed: true };
+  }
+  if (first === "find") {
+    return { words: [...split.assignments, ...rewriteFindWords(split.commandWords)], changed: true };
+  }
+  if (first === "fd" || first === "fdfind") {
+    return { words: [...split.assignments, ...rewriteFdWords(split.commandWords)], changed: true };
+  }
+  if (first === "locate") {
+    return { words: [...split.assignments, ...rewriteLocateWords(split.commandWords)], changed: true };
+  }
+
+  return { words, changed: false };
+}
+
+function replaceSearchCommand(command: string): SearchRewriteResult | null {
+  const tokens = shellTokenize(command);
+  const rebuiltTokens: RebuiltShellToken[] = [];
+  let segment: ShellToken[] = [];
+  let changed = false;
+
+  function flushSegment() {
+    if (segment.length === 0) return;
+    const rewrite = rewriteSearchSegment(segment.map((token) => token.text));
+    changed = changed || rewrite.changed;
+    rebuiltTokens.push(...rewrite.words.map((word) => ({ text: word, operator: false })));
+    segment = [];
+  }
+
+  for (const token of tokens) {
+    if (commandBreakers.has(token.text)) {
+      flushSegment();
+      rebuiltTokens.push({ text: token.text, operator: true });
+      continue;
+    }
+    segment.push(token);
+  }
+
+  flushSegment();
+  return changed ? { command: joinShellTokens(rebuiltTokens) } : null;
+}
+
+function hasRawDirectoryTrick(command: string): boolean {
+  const patterns = [
+    /(^|[\s;&|()])(?:builtin\s+|command\s+)?(?:cd|pushd|popd)(?=$|[\s;&|()])/i,
+    /(^|[\s;&|()])(?:git|hub|make|env|tar|pnpm)\s+(?:[^\n;&|]*\s)?-C(?=$|[\s=])/i,
+    /(?:^|[\s;&|])(?:GIT_DIR|GIT_WORK_TREE|PWD|OLDPWD|INIT_CWD)=/i,
+    /(?:^|[\s;&|])(?:bash|sh|zsh|fish|env)\s+[^\n;&|]*(?:\bcd\b|\bpushd\b|\bpopd\b)/i,
+    /(?:\$\(\s*pwd\s*\)|`\s*pwd\s*`|\$\{?PWD\}?|\$\{?HOME\}?)/i,
+  ];
+  return patterns.some((pattern) => pattern.test(command));
+}
+
+function isPythonCommand(word: string): boolean {
+  const command = normalizeCommandName(word);
+  return pythonCommands.has(command) || /^python\d+(?:\.\d+)?$/.test(command);
+}
+
+function unwrapCommandWrapper(words: string[]): string[] {
+  const runnableWords = stripLeadingAssignments(words);
+  const first = normalizeCommandName(runnableWords[0] ?? "");
+
+  if (["command", "exec", "time", "noglob"].includes(first)) return runnableWords.slice(1);
+
+  if (["uv", "poetry", "pipenv", "rye", "hatch"].includes(first) && runnableWords[1] === "run") {
+    return runnableWords.slice(2);
+  }
+
+  if (first === "env") {
+    const commandIndex = runnableWords.findIndex((word, index) => {
+      if (index === 0) return false;
+      if (word.startsWith("-")) return false;
+      return !/^[A-Za-z_][A-Za-z0-9_]*=.*/.test(word);
+    });
+    return commandIndex === -1 ? [] : runnableWords.slice(commandIndex);
+  }
+
+  if (first === "xargs") {
+    const commandIndex = runnableWords.findIndex((word, index) => index > 0 && isPythonCommand(word));
+    return commandIndex === -1 ? runnableWords : runnableWords.slice(commandIndex);
+  }
+
+  return runnableWords;
+}
+
+function hasRawPythonTrick(command: string): boolean {
+  return /(?:^|[\s;&|])(?:bash|sh|zsh|fish|env)\s+[^\n;&|]*\b(?:python\d*(?:\.\d+)?|pythonw|pypy\d?|py)\b/i.test(
+    command
+  );
+}
+
+function hasPythonUsage(command: string, tokens: ShellToken[]): boolean {
+  return (
+    hasRawPythonTrick(command) ||
+    commandSegments(tokens).some((segment) => isPythonCommand(unwrapCommandWrapper(segment)[0] ?? ""))
+  );
+}
+
+function hasRawDevServerTrick(command: string): boolean {
+  return /(?:^|[\s;&|])(?:bash|sh|zsh|fish|env)\s+[^\n;&|]*(?:\b(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?(?:dev|start|preview|serve)\b|\bnext\s+(?:dev|start)\b)/i.test(
+    command
+  );
+}
+
+function hasDevServerUsage(command: string, tokens: ShellToken[]): boolean {
+  if (hasRawDevServerTrick(command)) return true;
+
+  return commandSegments(tokens).some((segment) => {
+    const words = stripLeadingAssignments(segment);
+    const first = normalizeCommandName(words[0] ?? "");
+    const second = words[1] ?? "";
+    const third = words[2] ?? "";
+    const normalizedSecond = normalizeCommandName(second);
+    const normalizedThird = normalizeCommandName(third);
+
+    if (first === "bun") {
+      if (["dev", "start", "preview", "preview:watch"].includes(second)) return true;
+      if (second === "run" && ["dev", "start", "preview", "preview:watch"].includes(third)) return true;
+      if (/^(?:\.\/)?scripts\/dev(?:\.ts|\.js)?$/.test(second)) return true;
+      if (normalizedSecond === "next") return true;
+    }
+
+    if (devPackageManagers.has(first)) {
+      if (["dev", "start", "preview", "serve"].includes(second)) return true;
+      if (second === "run" && ["dev", "start", "preview", "serve"].includes(third)) return true;
+      if (first === "pnpm" && second === "dlx" && normalizedThird === "next") return true;
+      if (first === "yarn" && second === "dlx" && normalizedThird === "next") return true;
+    }
+
+    if (["npx", "bunx"].includes(first) && normalizedSecond === "next") return true;
+    if (first === "node" && ["dev", "next"].includes(normalizedSecond)) return true;
+    if (first === "node" && /^(?:\.\/)?scripts\/dev(?:\.ts|\.js)?$/.test(second)) return true;
+    if (devFrameworkCommands.has(first)) return true;
+    if (first === "webpack" && second === "serve") return true;
+    if (first === "turbo" && second === "dev") return true;
+    if (/^(?:\.\/)?node_modules\/\.bin\/(?:next|vite|nuxt|astro|remix)$/.test(words[0] ?? "")) {
+      return true;
+    }
+
+    return false;
+  });
+}
+
+function isGhApiEndpoint(words: string[], index: number): boolean {
+  const command = commandWord(words);
+  const apiIndex = words.findIndex((word) => word === "api");
+  if (command !== "gh" || apiIndex === -1 || index <= apiIndex) return false;
+  const hasDestructiveMethod = words.some((word, wordIndex) => {
+    if (word !== "-X" && word !== "--method") return false;
+    return destructiveGhApiFlags.has((words[wordIndex + 1] ?? "").toUpperCase());
+  });
+  return !hasDestructiveMethod;
+}
+
+function isUnsafePathToken(token: string): boolean {
+  const trimmed = token.trim();
+  if (!trimmed || /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(trimmed)) return false;
+  if (trimmed === "--") return false;
+
+  const value = trimmed.replace(/^["']|["']$/g, "");
+  const pathValue = value.includes("=") ? value.slice(value.indexOf("=") + 1) : value;
+
+  if (!pathValue || /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(pathValue)) return false;
+  if (pathValue === "/") return true;
+  if (pathValue.startsWith("/") || pathValue.startsWith("~/") || pathValue === "~") return true;
+  if (/^\$\{?HOME\}?($|\/)/.test(pathValue)) return true;
+  if (/^\$\{?PWD\}?($|\/)/.test(pathValue)) return true;
+  if (/\$\(\s*pwd\s*\)|`\s*pwd\s*`/.test(pathValue)) return true;
+  if (/(^|\/)\.\.($|\/)/.test(pathValue)) return true;
+  if (/^file:\/\//.test(pathValue)) return true;
+
+  return false;
+}
+
+function hasDirectoryFlagViolation(tokens: ShellToken[]): boolean {
+  return commandSegments(tokens).some((segment) => {
+    const words = stripLeadingAssignments(segment);
+    for (let index = 0; index < words.length; index += 1) {
+      const word = words[index] ?? "";
+      const [flagName] = word.split("=", 1);
+      if (pathOptionNames.has(flagName ?? word)) return true;
+      if (word.startsWith("--cwd=") || word.startsWith("--prefix=") || word.startsWith("--directory=")) {
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+function hasUnsafePathUsage(tokens: ShellToken[]): boolean {
+  return commandSegments(tokens).some((segment) => {
+    const words = stripLeadingAssignments(segment);
+    for (let index = 0; index < words.length; index += 1) {
+      const word = words[index] ?? "";
+      const assignmentName = word.includes("=") ? word.slice(0, word.indexOf("=")) : "";
+      if (pathAssignmentNames.has(assignmentName)) return true;
+      if (isGhApiEndpoint(words, index)) continue;
+      if (isUnsafePathToken(word)) return true;
+    }
+    return false;
+  });
+}
+
+export function analyzeBashCommand(command: string): RuleViolation | null {
+  const tokens = shellTokenize(command);
+
+  if (hasRawDirectoryTrick(command) || hasDirectoryFlagViolation(tokens) || hasUnsafePathUsage(tokens)) {
+    return { rule: "workdir", detail: WORKDIR_ERROR };
+  }
+
+  if (hasPythonUsage(command, tokens)) {
+    return { rule: "python", detail: PYTHON_ERROR };
+  }
+
+  if (hasDevServerUsage(command, tokens)) {
+    return { rule: "dev-server", detail: DEV_SERVER_ERROR };
+  }
+
+  return null;
+}
+
+function appendUnknownExitCode(text: string): string {
+  if (/exit(?:ed)?\s+(?:with\s+)?code|exit code/i.test(text)) return text;
+  return `${text ? `${text}\n\n` : ""}${EXIT_CODE_UNKNOWN}`;
+}
+
+function prefixRgReplacement(text: string, command: string): string {
+  return `${RG_REPLACEMENT_PREFIX}: ${command}\n${text}`;
+}
+
+function patchBashResultContent(
+  event: Parameters<Parameters<ExtensionAPI["on"]>[1]>[0]
+): ToolResultEventResult | null {
+  if (!isBashToolResult(event)) return null;
+
+  const replacementCommand = rgReplacementByToolCallId.get(event.toolCallId);
+  rgReplacementByToolCallId.delete(event.toolCallId);
+
+  if (!replacementCommand && !event.isError) return null;
+
+  let content = event.content;
+
+  if (replacementCommand) {
+    const firstTextIndex = content.findIndex((part) => part.type === "text");
+    if (firstTextIndex === -1) {
+      content = [{ type: "text" as const, text: `${RG_REPLACEMENT_PREFIX}: ${replacementCommand}\n` }, ...content];
+    } else {
+      content = content.map((part, index) =>
+        index === firstTextIndex && part.type === "text"
+          ? { ...part, text: prefixRgReplacement(part.text, replacementCommand) }
+          : part
+      );
+    }
+  }
+
+  if (!event.isError) return { content };
+
+  const lastTextIndex = content.findLastIndex((part) => part.type === "text");
+  if (lastTextIndex === -1) {
+    return { content: [...content, { type: "text" as const, text: EXIT_CODE_UNKNOWN }] };
+  }
+
+  return {
+    content: content.map((part, index) =>
+      index === lastTextIndex && part.type === "text"
+        ? { ...part, text: appendUnknownExitCode(part.text) }
+        : part
+    ),
+  };
+}
+
+export default function bashGuard(pi: ExtensionAPI) {
+  pi.on("tool_call", (event) => {
+    if (!isToolCallEventType("bash", event)) return;
+
+    try {
+      const replacement = replaceSearchCommand(event.input.command);
+      if (replacement) {
+        event.input.command = replacement.command;
+        rgReplacementByToolCallId.set(event.toolCallId, replacement.command);
+      }
+
+      const violation = analyzeBashCommand(event.input.command);
+      if (!violation) return;
+      rgReplacementByToolCallId.delete(event.toolCallId);
+      return block(violation.detail);
+    } catch (error) {
+      rgReplacementByToolCallId.delete(event.toolCallId);
+      const detail = error instanceof Error ? error.message : String(error);
+      return block(`${EXTENSION_FAILURE_ERROR}: ${detail}`);
+    }
+  });
+
+  pi.on("tool_result", (event) => patchBashResultContent(event));
+}
