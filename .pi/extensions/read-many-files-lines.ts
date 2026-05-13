@@ -3,10 +3,13 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { Static } from "typebox";
 import { Type } from "typebox";
+import { replaceSearchCommand } from "./bash-guard";
 
 const TOOL_NAME = "read-many-files-lines";
 const EXIT_CODE_ONE = "Exit code: 1";
-const FILE_READER_ERROR = `Do not use bash file readers such as cat, head, tail, sed, awk, less, more, nl, wc, cut, or similar commands. Use ${TOOL_NAME} instead.`;
+const FILE_READER_ERROR = `Do not use bash file readers/pagers/post-processors such as cat, head, tail, sed, awk, less, more, nl, wc, cut, sort, uniq, or similar commands. Use ${TOOL_NAME} instead when reading file contents.`;
+const FILE_SEARCH_PIPELINE_ERROR =
+  "Do not use bash file-listing/search pipelines with file readers/pagers/post-processors such as sort, head, tail, wc, cut, or similar commands.";
 const WHOLE_FILE_END = Number.MAX_SAFE_INTEGER;
 
 const readManyFilesLinesSchema = Type.Object({
@@ -232,7 +235,7 @@ function unwrapWrapper(words: string[]): string[] {
 }
 
 function hasRawShellWrappedFileRead(command: string): boolean {
-  return /(?:^|[\s;&|])(?:bash|sh|zsh|fish|env)\s+[^\n;&|]*\b(?:cat|head|tail|sed|awk|less|more|nl|wc|cut|bat|batcat)\b/i.test(
+  return /(?:^|[\s;&|])(?:bash|sh|zsh|fish|env)\s+[^\n;&|]*\b(?:cat|head|tail|sed|awk|less|more|nl|wc|cut|sort|uniq|od|strings|tac|xxd|bat|batcat)\b/i.test(
     command
   );
 }
@@ -249,6 +252,42 @@ function hasBashFileReader(command: string): boolean {
   });
 }
 
+function shellQuote(word: string): string {
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(word)) return word;
+  return `'${word.replace(/'/g, `'\\''`)}'`;
+}
+
+function joinShellWords(words: string[]): string {
+  return words.map(shellQuote).join(" ");
+}
+
+function firstRgCommand(command: string): string | null {
+  for (const segment of commandSegments(tokenizeShell(command))) {
+    const words = unwrapWrapper(segment);
+    if (normalizeCommandName(words[0] ?? "") === "rg") return joinShellWords(words);
+  }
+  return null;
+}
+
+function suggestedRgRetry(command: string): string | null {
+  const directRgCommand = firstRgCommand(command);
+  if (directRgCommand) return directRgCommand;
+
+  try {
+    const rewritten = replaceSearchCommand(command)?.command;
+    return rewritten ? firstRgCommand(rewritten) : null;
+  } catch {
+    return null;
+  }
+}
+
+function fileReaderBlockReason(command: string): string {
+  const rgCommand = suggestedRgRetry(command);
+  if (!rgCommand) return FILE_READER_ERROR;
+
+  return `${FILE_SEARCH_PIPELINE_ERROR} Retry with rg directly: \`${rgCommand}\`. Do not pipe it to sort/head; bash output is already truncated. Use ${TOOL_NAME} only when reading file contents.`;
+}
+
 export default function readManyFilesLines(pi: ExtensionAPI) {
   pi.registerTool({
     name: TOOL_NAME,
@@ -259,6 +298,7 @@ export default function readManyFilesLines(pi: ExtensionAPI) {
     promptGuidelines: [
       `Prefer ${TOOL_NAME} over the normal read tool when reading files, especially when reading multiple files or line ranges.`,
       `Use ${TOOL_NAME} instead of bash commands like cat, head, tail, sed, awk, less, or more for viewing file contents.`,
+      "For file listing/searching, use rg directly (for example, rg --files or rg -n); do not use find/sort/head pipelines.",
     ],
     async execute(_toolCallId, params: ReadManyFilesLinesInput) {
       const root = process.cwd();
@@ -275,6 +315,6 @@ export default function readManyFilesLines(pi: ExtensionAPI) {
     if (event.toolName !== "bash") return;
     const command = event.input.command as string;
     if (!hasBashFileReader(command)) return;
-    return { block: true, reason: `${FILE_READER_ERROR}\n${EXIT_CODE_ONE}` };
+    return { block: true, reason: `${fileReaderBlockReason(command)}\n${EXIT_CODE_ONE}` };
   });
 }

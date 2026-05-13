@@ -1,0 +1,258 @@
+import { spawn } from "node:child_process";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+
+const SUMMARY_KEY = "context-summary-footer";
+const REFRESH_EVERY_AGENT_TURNS = Number(process.env.PI_CTX_SUMMARY_EVERY ?? 3);
+const SUMMARY_TIMEOUT_MS = Number(process.env.PI_CTX_SUMMARY_TIMEOUT_MS ?? 20_000);
+const SUMMARY_MODEL = process.env.PI_CTX_SUMMARY_MODEL || "openai-codex/gpt-5.3-codex-spark";
+const MAX_USER_SAID_CHARS = 4_000;
+const MAX_SUMMARY_CHARS = 180;
+
+let summaryText = "Session context: starting up.";
+let agentTurnsSinceRefresh = REFRESH_EVERY_AGENT_TURNS;
+let summarizeInFlight = false;
+let pendingRefresh = false;
+let requestFooterRender: (() => void) | undefined;
+let lastPrompt = "";
+
+interface CommandResult {
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  timedOut: boolean;
+}
+
+const ESC = String.fromCharCode(27);
+const BEL = String.fromCharCode(7);
+const CSI_ANSI_RE = new RegExp(`${ESC}\\[[0-?]*[ -/]*[@-~]`, "g");
+const OSC_ANSI_RE = new RegExp(`${ESC}\\].*?(?:${BEL}|${ESC}\\\\)`, "g");
+
+function stripAnsi(text: string): string {
+  return text.replace(CSI_ANSI_RE, "").replace(OSC_ANSI_RE, "");
+}
+
+function oneLine(text: string): string {
+  return stripAnsi(text)
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function trimSentence(text: string): string {
+  const line = oneLine(text).replace(/^(["'`]+)|(["'`]+)$/g, "");
+  if (!line) return "Session context: active coding session.";
+  const withoutPrefix = line.replace(/^session context:\s*/i, "");
+  const truncated = withoutPrefix.length > MAX_SUMMARY_CHARS ? `${withoutPrefix.slice(0, MAX_SUMMARY_CHARS - 1).trim()}…` : withoutPrefix;
+  return `Session context: ${truncated}`;
+}
+
+function messageText(message: AgentMessage): string {
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object" && "text" in part && typeof part.text === "string") return part.text;
+        return "";
+      })
+      .filter(Boolean)
+      .join(" ");
+  }
+  return "";
+}
+
+function userSaid(ctx: ExtensionContext): string {
+  const entries = ctx.sessionManager.getBranch() as SessionEntry[];
+  const lines = entries
+    .filter((entry): entry is Extract<SessionEntry, { type: "message" }> => entry.type === "message" && entry.message.role === "user")
+    .map((entry) => oneLine(messageText(entry.message)))
+    .filter(Boolean)
+    .map((text) => `user: ${text}`);
+  if (lastPrompt.trim()) lines.push(`current user request: ${oneLine(lastPrompt)}`);
+  const text = lines.join("\n");
+  return text.length > MAX_USER_SAID_CHARS ? text.slice(-MAX_USER_SAID_CHARS) : text;
+}
+
+function runPiSummarizer(prompt: string, cwd: string, signal: AbortSignal | undefined): Promise<CommandResult> {
+  return new Promise((resolve) => {
+    const args = [
+      "--print",
+      "--mode",
+      "text",
+      "--model",
+      SUMMARY_MODEL,
+      "--thinking",
+      "off",
+      "--no-tools",
+      "--no-extensions",
+      "--no-skills",
+      "--no-prompt-templates",
+      "--no-context-files",
+      "--no-session",
+      "--system-prompt",
+      "You summarize coding-agent sessions. Reply with exactly one concise sentence, no markdown.",
+      prompt,
+    ];
+
+    const child = spawn(process.env.PI_CTX_SUMMARY_PI_BIN || "pi", args, {
+      cwd,
+      env: { ...process.env, PI_OFFLINE: process.env.PI_CTX_SUMMARY_OFFLINE ?? process.env.PI_OFFLINE },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let settled = false;
+    let timedOut = false;
+
+    const finish = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+      resolve({ stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"), code, timedOut });
+    };
+    const abort = () => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    };
+    const timeout = setTimeout(abort, SUMMARY_TIMEOUT_MS);
+    timeout.unref?.();
+    signal?.addEventListener("abort", abort, { once: true });
+
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", () => finish(1));
+    child.on("close", finish);
+  });
+}
+
+function heuristicSummary(ctx: ExtensionContext): string {
+  const entries = ctx.sessionManager.getBranch() as SessionEntry[];
+  const userTexts = entries
+    .filter((entry): entry is Extract<SessionEntry, { type: "message" }> => entry.type === "message" && entry.message.role === "user")
+    .map((entry) => oneLine(messageText(entry.message)))
+    .filter(Boolean);
+  const latest = lastPrompt.trim() || userTexts.at(-1) || "active coding session";
+  return trimSentence(latest);
+}
+
+async function refreshSummary(ctx: ExtensionContext, force = false): Promise<void> {
+  if (!ctx.hasUI) return;
+  if (summarizeInFlight) {
+    pendingRefresh = true;
+    return;
+  }
+  if (!force && agentTurnsSinceRefresh < REFRESH_EVERY_AGENT_TURNS) return;
+
+  summarizeInFlight = true;
+  pendingRefresh = false;
+  agentTurnsSinceRefresh = 0;
+  try {
+    const said = userSaid(ctx);
+    if (!said.trim()) {
+      summaryText = heuristicSummary(ctx);
+      return;
+    }
+    const prompt = `Summarize what this Pi coding session is about in exactly one sentence. Use only what the user said below; do not infer from assistant/tool context.\n\nUser said:\n${said}`;
+    const result = await runPiSummarizer(prompt, ctx.cwd, ctx.signal);
+    summaryText = result.code === 0 && result.stdout.trim() ? trimSentence(result.stdout) : heuristicSummary(ctx);
+  } catch {
+    summaryText = heuristicSummary(ctx);
+  } finally {
+    summarizeInFlight = false;
+    requestFooterRender?.();
+    if (pendingRefresh) void refreshSummary(ctx, true);
+  }
+}
+
+function formatTokens(count: number): string {
+  if (count < 1000) return count.toString();
+  if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+  if (count < 1000000) return `${Math.round(count / 1000)}k`;
+  return `${(count / 1000000).toFixed(1)}M`;
+}
+
+function installFooter(ctx: ExtensionContext): void {
+  if (!ctx.hasUI) return;
+  ctx.ui.setFooter((tui, theme, footerData) => {
+    requestFooterRender = () => tui.requestRender();
+    const unsub = footerData.onBranchChange(() => tui.requestRender());
+    return {
+      dispose() {
+        unsub();
+        if (requestFooterRender) requestFooterRender = undefined;
+      },
+      invalidate() {},
+      render(width: number): string[] {
+        let input = 0;
+        let output = 0;
+        let cost = 0;
+        for (const entry of ctx.sessionManager.getEntries()) {
+          if (entry.type === "message" && entry.message.role === "assistant") {
+            input += entry.message.usage.input;
+            output += entry.message.usage.output;
+            cost += entry.message.usage.cost.total;
+          }
+        }
+
+        let cwd = ctx.sessionManager.getCwd();
+        const home = process.env.HOME || process.env.USERPROFILE;
+        if (home && cwd.startsWith(home)) cwd = `~${cwd.slice(home.length)}`;
+        const branch = footerData.getGitBranch();
+        if (branch) cwd = `${cwd} (${branch})`;
+        const sessionName = ctx.sessionManager.getSessionName();
+        if (sessionName) cwd = `${cwd} • ${sessionName}`;
+
+        const usage = ctx.getContextUsage();
+        const percent = usage?.percent == null ? "?" : `${usage.percent.toFixed(1)}%`;
+        const window = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+        const statsLeft = [`↑${formatTokens(input)}`, `↓${formatTokens(output)}`, `$${cost.toFixed(3)}`, `${percent}/${formatTokens(window)}`].join(" ");
+        const model = ctx.model?.id || "no-model";
+        const pad = " ".repeat(Math.max(1, width - visibleWidth(statsLeft) - visibleWidth(model)));
+        const statsLine = truncateToWidth(theme.fg("dim", statsLeft + pad + model), width);
+
+        const lines = [
+          truncateToWidth(theme.fg("accent", summaryText), width, theme.fg("dim", "...")),
+          truncateToWidth(theme.fg("dim", cwd), width, theme.fg("dim", "...")),
+          statsLine,
+        ];
+
+        const statuses = Array.from(footerData.getExtensionStatuses().entries())
+          .filter(([key]) => key !== SUMMARY_KEY)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([, text]) => oneLine(text));
+        if (statuses.length) lines.push(truncateToWidth(statuses.join(" "), width, theme.fg("dim", "...")));
+        return lines;
+      },
+    };
+  });
+}
+
+export default function contextSummaryFooter(pi: ExtensionAPI): void {
+  pi.on("session_start", (_event, ctx) => {
+    summaryText = heuristicSummary(ctx);
+    agentTurnsSinceRefresh = REFRESH_EVERY_AGENT_TURNS;
+    installFooter(ctx);
+    void refreshSummary(ctx, true);
+  });
+
+  pi.on("before_agent_start", (event, ctx) => {
+    lastPrompt = event.prompt;
+    if (summaryText === "Session context: starting up.") summaryText = heuristicSummary(ctx);
+    requestFooterRender?.();
+  });
+
+  pi.on("agent_end", async (_event, ctx) => {
+    agentTurnsSinceRefresh += 1;
+    await refreshSummary(ctx);
+  });
+
+  pi.on("session_shutdown", (_event, ctx) => {
+    if (ctx.hasUI) ctx.ui.setFooter(undefined);
+    requestFooterRender = undefined;
+    lastPrompt = "";
+  });
+}

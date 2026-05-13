@@ -7,11 +7,14 @@ import { Text } from "@earendil-works/pi-tui";
 import type { Static } from "typebox";
 import { Type } from "typebox";
 import {
+  COMPLETION_MESSAGE_TYPE,
   CUSTOM_ENTRY_TYPE,
   formatQuestionForMainAgent,
-  formatSubagentCompletionForMainAgent,
+  formatSubagentCompletionSummary,
+  friendlySubagentName,
   planSubagentPlacement,
   restoreRecordsForWindow,
+  shortenHomePath,
   type SpawnedSubagentRecord,
   type SubagentDoneEvent,
   type SubagentQuestion,
@@ -74,6 +77,7 @@ let closed = false;
 let pendingUiRequest = null;
 let exitAfterChildClose = false;
 let waitingForMainAnswer = false;
+let toolResponsesExpanded = false;
 let activeTools = new Map();
 let openToolBlockKey = null;
 const launchedAt = Date.now();
@@ -84,6 +88,7 @@ let latestStopReason = "";
 let latestErrorMessage = "";
 let latestModel = "";
 let latestProvider = "";
+let latestThinkingLevel = "";
 let observedMessageKeys = new Set();
 const usageTotals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 };
 
@@ -175,6 +180,21 @@ function truncate(text, max = 1800) {
   const value = String(text ?? "");
   if (!value) return "";
   return value.length > max ? value.slice(0, max) + "…" : value;
+}
+
+function countLines(text) {
+  const value = String(text ?? "").trimEnd();
+  return value ? value.split("\\n").length : 0;
+}
+
+function formatCollapsedToolOutput(output, isError = false) {
+  const value = String(output ?? "").trimEnd();
+  if (!value) return "";
+  const lines = countLines(value);
+  const chars = value.length;
+  const summary = lines + " line" + (lines === 1 ? "" : "s") + ", " + chars + " char" + (chars === 1 ? "" : "s");
+  const label = isError ? "error output collapsed" : "output collapsed";
+  return label + " (" + summary + "; Ctrl-O toggles future output)";
 }
 
 function compact(text) {
@@ -286,6 +306,28 @@ function observeMessage(message) {
   if (message.provider) latestProvider = String(message.provider);
 }
 
+function observeState(data) {
+  if (!data || typeof data !== "object") return;
+  if (data.thinkingLevel) latestThinkingLevel = String(data.thinkingLevel);
+
+  const model = data.model;
+  if (typeof model === "string") {
+    latestModel = model;
+    return;
+  }
+  if (!model || typeof model !== "object") return;
+
+  if (model.id) latestModel = String(model.id);
+  else if (model.model) latestModel = String(model.model);
+  else if (model.name) latestModel = String(model.name);
+
+  const provider = model.provider;
+  if (typeof provider === "string") latestProvider = provider;
+  else if (provider && typeof provider === "object" && provider.id) latestProvider = String(provider.id);
+  else if (provider && typeof provider === "object" && provider.name) latestProvider = String(provider.name);
+  else if (model.providerName) latestProvider = String(model.providerName);
+}
+
 function statusFromStopReason(reason, errorMessage) {
   if (reason === "aborted") return "aborted";
   if (reason === "error" || errorMessage) return "error";
@@ -316,6 +358,8 @@ function completionPayload(endedAt) {
     runtimeMs: endedAt - launchedAt,
     agentRuntimeMs: firstAgentStartedAt ? endedAt - firstAgentStartedAt : undefined,
     usage,
+    effort: latestThinkingLevel || config.thinking || undefined,
+    thinkingLevel: latestThinkingLevel || config.thinking || undefined,
     model: latestModel || undefined,
     provider: latestProvider || undefined,
   };
@@ -362,6 +406,12 @@ function statusLine(label, detail = "", style = "muted") {
   line(paint("dim", "[" + stamp() + "] ") + paint(style, label) + (detail ? " " + detail : ""));
 }
 
+function toggleToolResponsesExpanded() {
+  toolResponsesExpanded = !toolResponsesExpanded;
+  const detail = toolResponsesExpanded ? "expanded; future output shown" : "collapsed; future output hidden";
+  statusLine("tool responses", detail, toolResponsesExpanded ? "accent" : "warning");
+}
+
 function communication(from, to, text, label = "") {
   const suffix = label ? " [" + label + "]" : "";
   const body = truncate(String(text ?? "").trim() || "(empty message)", 1800);
@@ -378,6 +428,7 @@ function banner() {
       "control " + dim(config.controlPath),
       "",
       "Type here and press Enter to talk directly.",
+      dim("Tool responses start collapsed. Press Ctrl-O in this pane to toggle future output."),
       dim("Commands: /steer <msg>, /follow <msg>, /abort, /quit"),
     ],
     "accent",
@@ -574,6 +625,19 @@ function resultTextFromEvent(event) {
   return stringify(result);
 }
 
+function printToolOutput(output, isError, insideToolBlock) {
+  if (!output) return;
+  if (toolResponsesExpanded) {
+    if (insideToolBlock) printIndentedInToolBlock(output, isError ? "error" : "muted");
+    else printIndented(output, isError ? "error" : "muted");
+    return;
+  }
+
+  const collapsed = dim(formatCollapsedToolOutput(output, isError));
+  if (insideToolBlock) printBlockRow(collapsed, "tool");
+  else printIndented(collapsed, isError ? "error" : "muted", 1200);
+}
+
 function printToolEnd(event) {
   const fallbackName = toolNameFrom(event);
   const key = toolKey(event, fallbackName);
@@ -589,12 +653,12 @@ function printToolEnd(event) {
   if (active?.wrapperOpen && openToolBlockKey === key) {
     printBlockRow("", "tool");
     printBlockRow(paint(style, icon + " tool ") + bold(name) + (elapsed ? dim("  " + elapsed) : ""), "tool");
-    if (output) printIndentedInToolBlock(output, event.isError ? "error" : "muted");
+    printToolOutput(output, Boolean(event.isError), true);
     printBlockEnd("tool");
     openToolBlockKey = null;
   } else {
     line(paint(style, icon + " tool ") + bold(name) + (elapsed ? dim("  " + elapsed) : ""));
-    if (output) printIndented(output, event.isError ? "error" : "muted");
+    printToolOutput(output, Boolean(event.isError), false);
   }
 
   if (name === "ask_main_agent" && !event.isError) {
@@ -721,8 +785,12 @@ function answerUiRequest(request, value) {
 }
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+readline.emitKeypressEvents(process.stdin, rl);
+process.stdin.on("keypress", (_sequence, key) => {
+  if (key?.ctrl && key.name === "o") toggleToolResponsesExpanded();
+});
 rl.on("line", (input) => {
-  const text = input.trim();
+  const text = input.replace(/\\x0f/g, "").trim();
 
   if (pendingUiRequest) {
     communication("you", "subagent ui", text || "(cancel)", pendingUiRequest.method || "answer");
@@ -797,6 +865,7 @@ function handleRpcEvent(event) {
 
   if (event.type === "response") {
     if (event.success === false) printBlock("rpc error", [event.error || event.command || "unknown error"], "error");
+    else if (event.command === "get_state") observeState(event.data);
     return;
   }
 
@@ -821,6 +890,7 @@ function handleRpcEvent(event) {
     assistantBlockOpen = false;
     assistantNeedsNewline = false;
     statusLine("agent started", "", "accent");
+    send({ type: "get_state" });
     return;
   }
 
@@ -914,6 +984,8 @@ child.on("close", (code, signal) => {
   }
   statusLine("pane left open", "Type /quit or close the pane when done.", "warning");
 });
+
+setTimeout(() => send({ type: "get_state" }), 100);
 
 setTimeout(async () => {
   if (config.promptPath) {
@@ -1115,8 +1187,7 @@ exec /bin/sh
 `;
 }
 
-async function writeSubagentFiles(ctx: ExtensionContext, spec: SubagentSpec, name: string, cwd: string) {
-  const id = randomUUID();
+async function writeSubagentFiles(ctx: ExtensionContext, spec: SubagentSpec, id: string, name: string, cwd: string) {
   const dir = path.resolve(ctx.cwd, TMP_ROOT, `${safeFilename(name)}-${id}`);
   await mkdir(dir, { recursive: true });
 
@@ -1145,6 +1216,7 @@ async function writeSubagentFiles(ctx: ExtensionContext, spec: SubagentSpec, nam
         cwd,
         promptPreview: previewText(spec.prompt),
         piArgs: piArgsForSpec(spec),
+        thinking: spec.thinking,
         promptPath,
         systemPromptPath,
         replaceSystemPrompt: spec.replaceSystemPrompt ?? false,
@@ -1204,13 +1276,13 @@ async function spawnOneSubagent(
   split: SplitDirection,
   size: string | undefined,
   spec: SubagentSpec,
-  index: number,
   windowId: string
 ): Promise<SpawnedSubagentRecord> {
-  const name = sanitizeName(spec.name, `subagent-${index + 1}`);
+  const id = randomUUID();
+  const name = sanitizeName(spec.name, friendlySubagentName(id));
   const cwd = resolveInsideRoot(ctx.cwd, spec.cwd);
   const validatedSize = validateSplitSize(size);
-  const files = await writeSubagentFiles(ctx, spec, name, cwd);
+  const files = await writeSubagentFiles(ctx, spec, id, name, cwd);
 
   const tmuxArgs = ["split-window", "-P", "-F", "#{pane_id}", "-t", targetPane];
   if (!spec.focus) tmuxArgs.push("-d");
@@ -1266,7 +1338,7 @@ async function spawnSubagents(
     const spec = input.agents[index];
     const placement = planSubagentPlacement(Boolean(stackTargetPane), spec.split, spec.size);
     const targetPane = placement.target === "main" ? tmux.paneId : stackTargetPane ?? tmux.paneId;
-    const record = await spawnOneSubagent(pi, ctx, targetPane, placement.split, placement.size, spec, index, tmux.windowId);
+    const record = await spawnOneSubagent(pi, ctx, targetPane, placement.split, placement.size, spec, tmux.windowId);
     records.push(record);
     stackTargetPane = record.paneId;
   }
@@ -1288,11 +1360,11 @@ function formatRecord(record: SpawnedSubagentRecord, status?: PaneStatus): strin
   const model = record.model ? ` model=${record.model}` : "";
   const provider = record.provider ? ` provider=${record.provider}` : "";
   return [
-    `${record.name} ${record.paneId} [${state}] id=${record.id}`,
-    `  cwd: ${record.cwd}`,
+    `${record.name} ${record.paneId} [${state}]`,
+    `  cwd: ${shortenHomePath(record.cwd)}`,
     `  task: ${record.promptPreview}`,
-    `  control: ${record.controlPath}`,
-    `  run: ${record.runScriptPath}${model}${provider}`,
+    `  control: ${shortenHomePath(record.controlPath)}`,
+    `  run: ${shortenHomePath(record.runScriptPath)}${model}${provider}`,
   ].join("\n");
 }
 
@@ -1443,9 +1515,15 @@ function forwardSubagentCompletion(
   record: SpawnedSubagentRecord,
   completion: SubagentDoneEvent
 ): void {
-  const message = formatSubagentCompletionForMainAgent(record, completion);
-  if (ctx.isIdle()) pi.sendUserMessage(message);
-  else pi.sendUserMessage(message, { deliverAs: "followUp" });
+  const message = formatSubagentCompletionSummary(record, completion);
+  const payload = {
+    customType: COMPLETION_MESSAGE_TYPE,
+    content: message,
+    display: true,
+    details: { subagentId: record.id, subagentName: record.name, paneId: record.paneId, completion },
+  };
+  if (ctx.isIdle()) pi.sendMessage(payload);
+  else pi.sendMessage(payload, { deliverAs: "followUp" });
 }
 
 async function pollSubagentOutboxes(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
@@ -1513,7 +1591,7 @@ async function handlePaneAction(pi: ExtensionAPI, ctx: ExtensionContext, input: 
   const record = findRecord(input.id);
   if (!record) {
     const known = Array.from(registry.values())
-      .map((r) => `${r.name} (${r.paneId}, ${r.id.slice(0, 8)})`)
+      .map((r) => `${r.name} (${r.paneId})`)
       .join(", ");
     throw new Error(`Unknown subagent: ${input.id ?? "(missing id)"}. Known: ${known || "none"}`);
   }
@@ -1542,7 +1620,7 @@ function spawnResultText(records: SpawnedSubagentRecord[]): string {
     `Spawned ${records.length} RPC subagent pane${records.length === 1 ? "" : "s"}.`,
     ...records.map(
       (record) =>
-        `- ${record.name}: ${record.paneId} (id ${record.id.slice(0, 8)})\n  task: ${record.promptPreview}\n  control: ${record.controlPath}`
+        `- ${record.name}: ${record.paneId}\n  task: ${record.promptPreview}\n  control: ${shortenHomePath(record.controlPath)}`
     ),
   ].join("\n");
 }
@@ -1563,7 +1641,8 @@ function parseSpawnArgs(args: string): SpawnSubagentsInput | null {
 async function promptForSubagent(ctx: ExtensionContext): Promise<SpawnSubagentsInput | null> {
   if (!ctx.hasUI) return null;
   const prompt = await ctx.ui.editor("Subagent prompt/task (optional; blank starts idle)", "");
-  const name = (await ctx.ui.input("Subagent name", "subagent")) || "subagent";
+  const nameInput = (await ctx.ui.input("Subagent name (optional)", "auto-generated")) || "";
+  const name = nameInput.trim() && nameInput.trim() !== "auto-generated" ? nameInput.trim() : undefined;
   const systemPrompt = await ctx.ui.editor("System instructions to append (optional)", "");
   const model = (await ctx.ui.input("Model (optional)", ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "")) || undefined;
   const toolsText = (await ctx.ui.input("Tool allowlist (optional comma-separated)", "")) || "";
@@ -1601,13 +1680,15 @@ function parseSubagentsCommand(args: string): PanesInput {
   const [actionRaw, id, third, ...rest] = trimmed.split(/\s+/);
   const action = (actionRaw || "list") as PaneAction;
   if (!["list", "capture", "kill", "send", "abort"].includes(action)) {
-    throw new Error("Usage: /subagents [list|capture <id> [lines]|kill <id>|abort <id>|send <id> <message>]");
+    throw new Error("Usage: /agents [list|capture <id> [lines]|kill <id>|abort <id>|send <id> <message>]");
   }
   if (action === "send") return { action, id, message: [third, ...rest].filter(Boolean).join(" ") };
   return { action, id, lines: third ? Number(third) : undefined };
 }
 
 export default function tmuxSubagents(pi: ExtensionAPI) {
+  pi.registerMessageRenderer(COMPLETION_MESSAGE_TYPE, (message) => new Text(String(message.content ?? ""), 0, 0));
+
   pi.on("session_start", async (_event, ctx) => {
     const tmux = await ensureTmux(pi, ctx.signal).catch(() => undefined);
     restoreRegistry(ctx, tmux?.windowId);
@@ -1705,7 +1786,7 @@ export default function tmuxSubagents(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("subagent", {
+  pi.registerCommand("agent", {
     description: "Spawn a Pi RPC subagent in a new tmux pane. Args: prompt text or JSON spec.",
     handler: async (args, ctx) => {
       let input: SpawnSubagentsInput | null;
@@ -1730,8 +1811,8 @@ export default function tmuxSubagents(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("subagents", {
-    description: "List/capture/send/abort/kill spawned subagent panes. Usage: /subagents [list|capture <id> [lines]|send <id> <msg>|abort <id>|kill <id>]",
+  pi.registerCommand("agents", {
+    description: "List/capture/send/abort/kill spawned subagent panes. Usage: /agents [list|capture <id> [lines]|send <id> <msg>|abort <id>|kill <id>]",
     handler: async (args, ctx) => {
       let input: PanesInput;
       try {

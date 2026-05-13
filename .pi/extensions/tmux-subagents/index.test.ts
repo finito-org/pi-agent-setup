@@ -1,12 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
   formatQuestionForMainAgent,
-  formatSubagentCompletionForMainAgent,
+  formatSubagentCompletionSummary,
+  friendlySubagentName,
   formatSubagentDuration,
+  formatSubagentModel,
   formatSubagentUsage,
   planSubagentPlacement,
   questionNeedsUserPrompt,
   restoreRecordsForWindow,
+  shortenHomePath,
   type SpawnedSubagentRecord,
 } from "./state";
 
@@ -60,6 +63,20 @@ describe("planSubagentPlacement", () => {
   });
 });
 
+describe("friendly ids and paths", () => {
+  test("creates a stable human-friendly subagent name from uuid", () => {
+    const name = friendlySubagentName("64b47174-8be0-4757-875b-7f14c9f52607");
+
+    expect(name).toMatch(/^[a-z]+-[a-z]+-64b4$/);
+    expect(name).toBe(friendlySubagentName("64b47174-8be0-4757-875b-7f14c9f52607"));
+  });
+
+  test("shortens paths under home with tilde", () => {
+    expect(shortenHomePath("/Users/OmryN/finito/pi/.pi/tmp/file", "/Users/OmryN")).toBe("~/finito/pi/.pi/tmp/file");
+    expect(shortenHomePath("/tmp/file", "/Users/OmryN")).toBe("/tmp/file");
+  });
+});
+
 describe("question forwarding", () => {
   test("prompts the user when the subagent is unsure", () => {
     expect(
@@ -89,28 +106,44 @@ describe("question forwarding", () => {
 
 describe("completion summaries", () => {
   test("formats duration and usage", () => {
-    expect(formatSubagentDuration(123_400)).toBe("2m 3s");
-    expect(formatSubagentUsage({ input: 1200, output: 345, cacheRead: 0, cacheWrite: 0, totalTokens: 1545, cost: 0.01234, turns: 1 })).toBe(
-      "1 turn ↑1.2k ↓345 total:1.5k $0.0123"
-    );
+    expect(formatSubagentDuration(123_400)).toBe("2:03");
+    expect(
+      formatSubagentUsage(
+        { input: 36_000, output: 12_000, cacheRead: 373_000, cacheWrite: 0, totalTokens: 421_000, cost: 0.73, turns: 20 },
+        321_000
+      )
+    ).toBe("5:21 20 turns ↑36k ↓12k R373k total:421k $0.73");
+    expect(
+      formatSubagentUsage(
+        { input: 36_000, output: 12_000, cacheRead: 373_000, cacheWrite: 0, totalTokens: 421_000, cost: 0.73, turns: 20 },
+        321_000,
+        "high"
+      )
+    ).toBe("5:21 effort:high 20 turns ↑36k ↓12k R373k total:421k $0.73");
+    expect(formatSubagentModel("openai-codex", "gpt-5.5")).toBe("openai-codex/gpt-5.5");
+    expect(formatSubagentModel("openai-codex", "openai-codex/gpt-5.5")).toBe("openai-codex/gpt-5.5");
   });
 
-  test("asks the main agent to summarize completion details", () => {
-    const text = formatSubagentCompletionForMainAgent(record("worker", "%7", "@current"), {
+  test("formats a brief completion summary without the main-agent prompt block", () => {
+    const text = formatSubagentCompletionSummary({ ...record("worker", "%7", "@current"), thinking: "high" }, {
       type: "done",
       task: "Review the tmux subagent extension.",
-      result: "Found no blocking issues; recommended one test update.",
+      result: "1:47 effort:low 15 turns ↑48k ↓2.8k R195k total:246k $0.42\n✅ Identified spawn-time profiles and runtime RPC configuration as the best path.",
       runtimeMs: 65_000,
       usage: { input: 1000, output: 250, totalTokens: 1250, cost: 0.0042, turns: 1 },
       status: "success",
       model: "claude-test",
     });
 
-    expect(text).toContain('Subagent "worker" (%7) finished.');
-    expect(text).toContain("Task:\nReview the tmux subagent extension.");
-    expect(text).toContain("Runtime: 1m 5s");
-    expect(text).toContain("Cost: $0.0042");
-    expect(text).toContain("Result:\nFound no blocking issues");
+    expect(text).toBe(
+      [
+        "Task: Review the tmux subagent extension.",
+        "1:05 effort:high 1 turn ↑1k ↓250 total:1.3k $0.00",
+        "✅ Identified spawn-time profiles and runtime RPC configuration as the best path.",
+      ].join("\n")
+    );
+    expect(text).not.toContain("Write a concise subagent completion summary");
+    expect(text).not.toContain("Usage line:");
   });
 });
 
